@@ -1,70 +1,135 @@
-name: Claude Auto Review and Comment
+name: Claude PR Review
+
 on:
-  pull_request:
-      types: [opened, synchronize]
-        issue_comment:
-            types: [created, edited]
-              pull_request_review_comment:
-                  types: [created, edited]
+  issue_comments:
+    types: [created, edited]
 
-                  jobs:
-                    review:
-                        runs-on: ubuntu-latest
-                            permissions:
-                                  contents: read
-                                        pull-requests: write
-                                              issues: write
-                                                    id-token: write
+permissions:
+  issues: write
+  pull-requests: write
+  contents: read
 
-                                                            # Only run if it's a new PR or if @claude is mentioned in a comment
-                                                                if: |
-                                                                      (github.event_name == 'pull_request') ||
-                                                                            (contains(github.event.comment.body, '@claude')) ||
-                                                                                  (contains(github.event.review_comment.body, '@claude'))
+jobs:
+  claude-review:
+    runs-on: ubuntu-latest
+    if: contains(github.event.comment.body, '@claude')
 
-                                                                                          steps:
-                                                                                                - uses: actions/checkout@v6
-                                                                                                        with:
-                                                                                                                  fetch-depth: 1
-                                                                                                                        
-                                                                                                                              - uses: anthropics/claude-code-action@v1
-                                                                                                                                      with:
-                                                                                                                                                anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-                                                                                                                                                          prompt: |
-                                                                                                                                                                      You are Claude, a helpful AI assistant bot in this GitHub repository.
-                                                                                                                                                                                  
-                                                                                                                                                                                              CONTEXT:
-                                                                                                                                                                                                          - Repository: ${{ github.repository }}
-                                                                                                                                                                                                                      - Event Type: ${{ github.event_name }}
-                                                                                                                                                                                                                                  - Triggered by: ${{ github.event.sender.login }}
-                                                                                                                                                                                                                                              
-                                                                                                                                                                                                                                                          {% if github.event_name == 'pull_request' %}
-                                                                                                                                                                                                                                                                      - PR Number: ${{ github.event.pull_request.number }}
-                                                                                                                                                                                                                                                                                  - PR Title: ${{ github.event.pull_request.title }}
-                                                                                                                                                                                                                                                                                              - Action: ${{ github.event.action }}
-                                                                                                                                                                                                                                                                                                          
-                                                                                                                                                                                                                                                                                                                      Please review this pull request with a focus on:
-                                                                                                                                                                                                                                                                                                                                  - Code quality and best practices
-                                                                                                                                                                                                                                                                                                                                              - Potential bugs or issues
-                                                                                                                                                                                                                                                                                                                                                          - Security implications
-                                                                                                                                                                                                                                                                                                                                                                      - Performance considerations
-                                                                                                                                                                                                                                                                                                                                                                                  
-                                                                                                                                                                                                                                                                                                                                                                                              The PR branch is already checked out in the current working directory.
-                                                                                                                                                                                                                                                                                                                                                                                                          Use `gh pr comment` for top-level feedback.
-                                                                                                                                                                                                                                                                                                                                                                                                                      Use `mcp__github_inline_comment__create_inline_comment` (with `confirmed: true`) to highlight specific code issues.
-                                                                                                                                                                                                                                                                                                                                                                                                                                  Only post GitHub comments - don't submit review text as messages.
-                                                                                                                                                                                                                                                                                                                                                                                                                                              {% else %}
-                                                                                                                                                                                                                                                                                                                                                                                                                                                          - Comment Author: ${{ github.event.comment.author_association }}
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                      - Comment Body: ${{ github.event.comment.body }}
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              A user mentioned you (@claude) in a comment. Please:
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          1. Read and understand their request in the comment
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      2. Analyze any referenced code or issue
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  3. Provide a helpful technical response
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              4. Post your response as a comment using `gh` commands
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      If they ask for code review, bug analysis, architecture suggestions, or improvements, provide detailed technical feedback with examples.
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  Use `gh issue comment` or `gh pr comment` to respond, depending on the context.
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              {% endif %}
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        claude_args: |
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh issue comment:*),Bash(gh issue view:*)"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get PR details
+        id: pr-details
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.issue;
+            const comment = context.payload.comment;
+            
+            // Get PR details
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: issue.number
+            });
+            
+            // Get all files changed
+            const files = await github.rest.pulls.listFiles({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: issue.number
+            });
+            
+            core.setOutput('pr_number', issue.number);
+            core.setOutput('comment_id', comment.id);
+            core.setOutput('comment_body', comment.body);
+            core.setOutput('pr_title', pr.data.title);
+            core.setOutput('pr_body', pr.data.body);
+            core.setOutput('files', JSON.stringify(files.data.map(f => ({
+              name: f.filename,
+              changes: f.changes,
+              status: f.status
+            }))));
+
+      - name: Get PR diff
+        id: pr-diff
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.issue;
+            
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: issue.number
+            });
+            
+            core.setOutput('diff_url', pr.data.diff_url);
+
+      - name: Fetch PR diff content
+        id: fetch-diff
+        run: |
+          curl -s ${{ steps.pr-diff.outputs.diff_url }} > /tmp/pr.diff
+          diff_content=$(head -c 3000 /tmp/pr.diff)
+          echo "diff_content<<EOF" >> $GITHUB_OUTPUT
+          echo "$diff_content" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Call Claude API for review
+        id: claude-review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          cat > /tmp/claude_request.json << 'EOF'
+          {
+            "model": "claude-opus-4-20250805",
+            "max_tokens": 1024,
+            "messages": [
+              {
+                "role": "user",
+                "content": "You are a code review assistant. Review the following PR comment and provide constructive feedback.\n\nPR Title: ${{ steps.pr-details.outputs.pr_title }}\n\nComment: ${{ steps.pr-details.outputs.comment_body }}\n\nPR Description: ${{ steps.pr-details.outputs.pr_body }}\n\nFiles Changed:\n${{ steps.pr-details.outputs.files }}\n\nPR Diff (first 3000 chars):\n${{ steps.fetch-diff.outputs.diff_content }}\n\nPlease provide a code review for this comment. Be concise and actionable."
+              }
+            ]
+          }
+          EOF
+          
+          response=$(curl -s https://api.anthropic.com/v1/messages \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            -d @/tmp/claude_request.json)
+          
+          review=$(echo "$response" | jq -r '.content[0].text')
+          echo "review<<EOF" >> $GITHUB_OUTPUT
+          echo "$review" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Post review comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.issue;
+            const review = `${{ steps.claude-review.outputs.review }}`;
+            
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              body: `## 🤖 Claude Review\n\n${review}`
+            });
+
+      - name: Handle errors
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.issue;
+            
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              body: '❌ Claude review failed. Please check your API key and try again.'
+            });
