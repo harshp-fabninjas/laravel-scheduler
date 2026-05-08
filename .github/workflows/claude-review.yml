@@ -58,7 +58,7 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          node << 'EOF'
+          cat > review_script.js << 'ENDSCRIPT'
           const fs = require('fs');
           const Anthropic = require('@anthropic-ai/sdk');
 
@@ -69,26 +69,22 @@ jobs:
               });
 
               const prDiff = fs.readFileSync('pr.diff', 'utf-8');
-              const prTitle = '${{ steps.pr_info.outputs.PR_TITLE }}';
-              const prBody = `${{ steps.pr_info.outputs.pr_body }}`;
+              const prTitle = process.env.PR_TITLE;
+              const prBody = process.env.PR_BODY || 'No description provided';
 
-              const reviewPrompt = `You are an expert code reviewer. Review this Pull Request and provide constructive feedback.
-
-PR Title: ${prTitle}
-PR Description: ${prBody || 'No description provided'}
-
-Diff:
-\`\`\`
-${prDiff}
-\`\`\`
-
-Provide a concise but thorough code review covering:
-1. Code quality and style
-2. Potential issues or bugs
-3. Suggestions for improvement
-4. Any security concerns
-
-Keep the review concise and actionable.`;
+              const reviewPrompt = 'You are an expert code reviewer. Review this Pull Request and provide constructive feedback.\n\n' +
+                'PR Title: ' + prTitle + '\n' +
+                'PR Description: ' + prBody + '\n\n' +
+                'Diff:\n' +
+                '```\n' +
+                prDiff + '\n' +
+                '```\n\n' +
+                'Provide a concise but thorough code review covering:\n' +
+                '1. Code quality and style\n' +
+                '2. Potential issues or bugs\n' +
+                '3. Suggestions for improvement\n' +
+                '4. Any security concerns\n\n' +
+                'Keep the review concise and actionable.';
 
               const response = await client.messages.create({
                 model: 'claude-3-5-haiku-20241022',
@@ -109,7 +105,8 @@ Keep the review concise and actionable.`;
               process.exit(1);
             }
           })();
-          EOF
+          ENDSCRIPT
+          PR_TITLE="${{ steps.pr_info.outputs.PR_TITLE }}" PR_BODY="${{ steps.pr_info.outputs.pr_body }}" node review_script.js
 
       - name: Post review as comment
         uses: actions/github-script@v7
