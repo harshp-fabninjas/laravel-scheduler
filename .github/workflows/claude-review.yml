@@ -1,7 +1,7 @@
 name: Claude PR Review
 
 on:
-  issue_comments:
+  issue_comment:
     types: [created, edited]
 
 permissions:
