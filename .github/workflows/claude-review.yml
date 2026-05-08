@@ -1,133 +1,111 @@
-name: Claude PR Review - Simple
+name: Claude Code
 
 on:
+  issues:
+    types: [labeled]
   issue_comment:
-    types: [created, edited]
-
-permissions:
-  issues: write
-  pull-requests: write
-  contents: read
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
 
 jobs:
-  claude-review:
+  claude:
+    if: >-
+      (github.event_name == 'issues' && github.event.label.name == 'claude' && 
+       contains(fromJson('["mlr"]'), github.event.sender.login)) ||
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude') && 
+       contains(fromJson('["OWNER", "MEMBER"]'), github.event.comment.author_association)) ||
+      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude') && 
+       contains(fromJson('["OWNER", "MEMBER"]'), github.event.review.author_association)) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude') && 
+       contains(fromJson('["OWNER", "MEMBER"]'), github.event.comment.author_association))
+
     runs-on: ubuntu-latest
-    if: |
-      contains(github.event.comment.body, '@claude') && 
-      github.event.issue.pull_request != null
-
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      id-token: write
+      actions: read # Required for Claude to read CI results on PRs
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Print debug info
-        run: |
-          echo "Comment: ${{ github.event.comment.body }}"
-          echo "Issue Number: ${{ github.event.issue.number }}"
-
-      - name: Prepare Claude prompt
-        id: prompt
-        run: |
-          USER_MESSAGE="${{ github.event.comment.body }}"
-          USER_MESSAGE="${USER_MESSAGE//@claude/}"
-          USER_MESSAGE=$(echo "$USER_MESSAGE" | xargs)
-          echo "cleaned_message=$USER_MESSAGE" >> $GITHUB_OUTPUT
-
-      - name: Get PR Details
-        id: pr
-        uses: actions/github-script@v7
         with:
-          script: |
-            const pr = await github.rest.pulls.get({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: context.issue.number
-            });
-            
-            core.setOutput('title', pr.data.title);
-            core.setOutput('body', pr.data.body || '');
-            core.setOutput('author', pr.data.user.login);
-            core.setOutput('additions', pr.data.additions);
-            core.setOutput('deletions', pr.data.deletions);
+          fetch-depth: 1
 
-      - name: Call Claude API
+      - name: Run Claude Code
         id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+
+          # This is an optional setting that allows Claude to read CI results on PRs
+          additional_permissions: |
+            actions: read
+
+          # Custom prompt with strict formatting rules
+          prompt: |
+            **IMPORTANT - WHEN WORKING ON ISSUES:**
+            After you finish implementing the code changes and committing them, create a pull request:
+            ```
+            gh pr create --title "Your descriptive title" --body "## Summary
+            Your summary of what was implemented.
+             
+            Closes #${{ github.event.issue.number }}"
+            ```
+            Always include a summary of changes AND "Closes #${{ github.event.issue.number }}" in the body.
+             
+            **COMMIT RULES:**
+            - Do NOT add "Co-authored-by" lines to commits
+            - Do NOT add "Generated with Claude Code" or similar attributions
+            - Keep commits clean and professional
+          
+            **WHEN WORKING ON PR FEEDBACK:**
+            Make the requested changes and commit. The PR will automatically update - do NOT create a new PR.
+           
+            **WHEN FIXING CI FAILURES:**
+            Fix the issues, commit the fix. The CI will automatically re-run.
+           
+            **OUTPUT RULES:**
+          
+            ## Commit Message Requirements (max 72 chars)
+            - Imperative mood: "Add" not "Added"
+            - Action verbs: Add, Update, Fix, Remove, Refactor, Implement
+            - No articles (a, an, the)
+            - No punctuation at end
+            - No prefixes like "feat:", "fix:"
+            - Single line only
+            - NO co-author attributions
+
+          # Enable progress tracking
+          track_progress: true
+
+          # Claude CLI arguments
+          claude_args: |
+            --model "claude-opus-4-5"
+            --max-turns 100
+            --allowedTools "Bash(git:*),Bash(gh issue:*),Bash(gh pr:*),Bash(gh repo:*),Bash(npm:*),Bash(npx:*),Edit,Write,Read,Glob,Grep,LS,WebSearch,WebFetch"
+
+      # Clean up the comment - remove the malformed "Create PR" link and trailing artifacts
+      - name: Clean up Claude comment
+        if: github.event_name == 'issues'
         env:
-          CLEANED_MSG: ${{ steps.prompt.outputs.cleaned_message }}
-          PR_TITLE: ${{ steps.pr.outputs.title }}
-          PR_AUTHOR: ${{ steps.pr.outputs.author }}
-          PR_ADDITIONS: ${{ steps.pr.outputs.additions }}
-          PR_DELETIONS: ${{ steps.pr.outputs.deletions }}
-          PR_BODY: ${{ steps.pr.outputs.body }}
-          API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
-          # Create request JSON
-          REQUEST=$(cat <<'REQEOF'
-          {
-            "model": "claude-haiku-4-20250122",
-            "max_tokens": 2048,
-            "messages": [
-              {
-                "role": "user",
-                "content": "You are a code review assistant on GitHub.\n\nUser's Request: USER_MSG_HERE\n\nPR Title: PR_TITLE_HERE\nPR Author: PR_AUTHOR_HERE\nPR Stats: +PR_ADDITIONS_HERE / -PR_DELETIONS_HERE\nPR Description: PR_BODY_HERE\n\nPlease respond to their request with helpful, specific feedback about the PR."
-              }
-            ]
-          }
-          REQEOF
-          )
-          
-          # Replace placeholders
-          REQUEST="${REQUEST//USER_MSG_HERE/$CLEANED_MSG}"
-          REQUEST="${REQUEST//PR_TITLE_HERE/$PR_TITLE}"
-          REQUEST="${REQUEST//PR_AUTHOR_HERE/$PR_AUTHOR}"
-          REQUEST="${REQUEST//PR_ADDITIONS_HERE/$PR_ADDITIONS}"
-          REQUEST="${REQUEST//PR_DELETIONS_HERE/$PR_DELETIONS}"
-          REQUEST="${REQUEST//PR_BODY_HERE/$PR_BODY}"
-          
-          # Make API call
-          RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
-            -H "x-api-key: $API_KEY" \
-            -H "anthropic-version: 2023-06-01" \
-            -H "content-type: application/json" \
-            -d "$REQUEST")
-          
-          echo "API Response:"
-          echo "$RESPONSE" | jq . || echo "$RESPONSE"
-          
-          # Extract review
-          REVIEW=$(echo "$RESPONSE" | jq -r '.content[0].text // empty')
-          
-          if [ -z "$REVIEW" ]; then
-            echo "ERROR: No review found"
-            exit 1
+          # Get the latest comment from Claude on this issue
+          COMMENT_ID=$(gh api repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments --jq '.[-1].id')
+
+          if [ -n "$COMMENT_ID" ]; then
+            # Get current comment body
+            BODY=$(gh api repos/${{ github.repository }}/issues/comments/$COMMENT_ID --jq '.body')
+
+            # Remove the "Create PR" link and any trailing pipe/whitespace
+            CLEANED=$(echo "$BODY" | sed 's/ • \[Create PR ➔\]([^)]*)//g' | sed 's/[[:space:]]*|[[:space:]]*$//')
+
+            # Update the comment
+            gh api repos/${{ github.repository }}/issues/comments/$COMMENT_ID \
+              -X PATCH \
+              -f body="$CLEANED"
           fi
-          
-          # Save output
-          echo "review<<REVIEWEOF" >> $GITHUB_OUTPUT
-          echo "$REVIEW" >> $GITHUB_OUTPUT
-          echo "REVIEWEOF" >> $GITHUB_OUTPUT
-
-      - name: Post Review Comment
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const review = `${{ steps.claude.outputs.review }}`;
-            
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: `### 🤖 Claude Bot Response\n\n${review}`
-            });
-
-      - name: Post Error (if failed)
-        if: failure()
-        uses: actions/github-script@v7
-        with:
-          script: |
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: `❌ Claude review failed.\n\nMake sure:\n1. ANTHROPIC_API_KEY is set in Settings → Secrets\n2. API key is valid\n3. Check workflow logs for details`
-            });
