@@ -64,7 +64,7 @@ jobs:
           # Create request JSON
           REQUEST=$(cat <<'REQEOF'
           {
-            "model": "claude-opus-4-20250805",
+            "model": "claude-haiku-4-20250122",
             "max_tokens": 2048,
             "messages": [
               {
