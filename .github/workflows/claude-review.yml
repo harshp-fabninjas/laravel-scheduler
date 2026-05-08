@@ -12,7 +12,9 @@ permissions:
 jobs:
   claude-review:
     runs-on: ubuntu-latest
-    if: contains(github.event.comment.body, '@claude')
+    if: |
+      contains(github.event.comment.body, '@claude') && 
+      github.event.issue.pull_request != null
 
     steps:
       - name: Checkout repository
@@ -20,116 +22,153 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Get PR details
-        id: pr-details
+      - name: Extract comment and PR details
+        id: extract
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const issue = context.issue;
-            const comment = context.payload.comment;
+            const comment_body = context.payload.comment.body;
+            const issue_number = context.issue.number;
             
-            // Get PR details
+            console.log('Comment Body:', comment_body);
+            
+            // Remove @claude mention from comment
+            const clean_comment = comment_body.replace(/@claude\s*/gi, '').trim();
+            
+            core.setOutput('comment', clean_comment);
+            core.setOutput('issue_number', issue_number);
+
+      - name: Get PR information
+        id: pr-info
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
             const pr = await github.rest.pulls.get({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              pull_number: issue.number
+              pull_number: context.issue.number
             });
             
-            // Get all files changed
+            core.setOutput('pr_title', pr.data.title);
+            core.setOutput('pr_body', pr.data.body || 'No description provided');
+            core.setOutput('pr_author', pr.data.user.login);
+
+      - name: Get changed files
+        id: files
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
             const files = await github.rest.pulls.listFiles({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              pull_number: issue.number
+              pull_number: context.issue.number,
+              per_page: 50
             });
             
-            core.setOutput('pr_number', issue.number);
-            core.setOutput('comment_id', comment.id);
-            core.setOutput('comment_body', comment.body);
-            core.setOutput('pr_title', pr.data.title);
-            core.setOutput('pr_body', pr.data.body);
-            core.setOutput('files', JSON.stringify(files.data.map(f => ({
-              name: f.filename,
-              changes: f.changes,
-              status: f.status
-            }))));
-
-      - name: Get PR diff
-        id: pr-diff
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const issue = context.issue;
+            const file_list = files.data.map(f => `- ${f.filename} (${f.status}, +${f.additions}-${f.deletions})`).join('\n');
             
-            const pr = await github.rest.pulls.get({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: issue.number
-            });
-            
-            core.setOutput('diff_url', pr.data.diff_url);
+            core.setOutput('files', file_list);
 
-      - name: Fetch PR diff content
-        id: fetch-diff
+      - name: Download PR diff
+        id: diff
         run: |
-          curl -s ${{ steps.pr-diff.outputs.diff_url }} > /tmp/pr.diff
-          diff_content=$(head -c 3000 /tmp/pr.diff)
-          echo "diff_content<<EOF" >> $GITHUB_OUTPUT
-          echo "$diff_content" >> $GITHUB_OUTPUT
+          PR_NUMBER=${{ steps.extract.outputs.issue_number }}
+          REPO_OWNER=${{ github.repository_owner }}
+          REPO_NAME=${{ github.event.repository.name }}
+          
+          curl -s \
+            -H "Accept: application/vnd.github.v3.diff" \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${PR_NUMBER}" \
+            -o /tmp/pr.diff
+          
+          # Get first 5000 chars of diff
+          DIFF_CONTENT=$(head -c 5000 /tmp/pr.diff)
+          
+          echo "diff<<EOF" >> $GITHUB_OUTPUT
+          echo "$DIFF_CONTENT" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-      - name: Call Claude API for review
-        id: claude-review
+      - name: Call Claude API
+        id: claude-api
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          cat > /tmp/claude_request.json << 'EOF'
+          # Create the API request payload
+          cat > /tmp/request.json << 'EOF'
           {
             "model": "claude-opus-4-20250805",
-            "max_tokens": 1024,
+            "max_tokens": 2048,
             "messages": [
               {
                 "role": "user",
-                "content": "You are a code review assistant. Review the following PR comment and provide constructive feedback.\n\nPR Title: ${{ steps.pr-details.outputs.pr_title }}\n\nComment: ${{ steps.pr-details.outputs.comment_body }}\n\nPR Description: ${{ steps.pr-details.outputs.pr_body }}\n\nFiles Changed:\n${{ steps.pr-details.outputs.files }}\n\nPR Diff (first 3000 chars):\n${{ steps.fetch-diff.outputs.diff_content }}\n\nPlease provide a code review for this comment. Be concise and actionable."
+                "content": "You are a helpful code review assistant for GitHub Pull Requests.\n\n**User's Comment/Request:**\n${{ steps.extract.outputs.comment }}\n\n**PR Title:**\n${{ steps.pr-info.outputs.pr_title }}\n\n**PR Description:**\n${{ steps.pr-info.outputs.pr_body }}\n\n**Files Changed:**\n${{ steps.files.outputs.files }}\n\n**PR Diff (First 5000 chars):**\n```\n${{ steps.diff.outputs.diff }}\n```\n\nPlease respond to the user's request about this PR. Be concise, specific, and actionable."
               }
             ]
           }
           EOF
           
-          response=$(curl -s https://api.anthropic.com/v1/messages \
+          # Call Anthropic API
+          RESPONSE=$(curl -s \
+            -X POST "https://api.anthropic.com/v1/messages" \
             -H "x-api-key: $ANTHROPIC_API_KEY" \
             -H "anthropic-version: 2023-06-01" \
             -H "content-type: application/json" \
-            -d @/tmp/claude_request.json)
+            -d @/tmp/request.json)
           
-          review=$(echo "$response" | jq -r '.content[0].text')
+          echo "Response from API:"
+          echo "$RESPONSE"
+          
+          # Extract the text response
+          REVIEW=$(echo "$RESPONSE" | jq -r '.content[0].text // empty')
+          
+          if [ -z "$REVIEW" ]; then
+            ERROR=$(echo "$RESPONSE" | jq -r '.error.message // "Unknown error"')
+            echo "error<<EOF" >> $GITHUB_OUTPUT
+            echo "$ERROR" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          
           echo "review<<EOF" >> $GITHUB_OUTPUT
-          echo "$review" >> $GITHUB_OUTPUT
+          echo "$REVIEW" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-      - name: Post review comment
+      - name: Post review as comment
+        if: success()
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const issue = context.issue;
-            const review = `${{ steps.claude-review.outputs.review }}`;
+            const review = `${{ steps.claude-api.outputs.review }}`;
+            const issue_number = ${{ steps.extract.outputs.issue_number }};
             
-            github.rest.issues.createComment({
+            console.log('Posting review comment:', review);
+            
+            const comment = await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: issue.number,
-              body: `## 🤖 Claude Review\n\n${review}`
+              issue_number: issue_number,
+              body: `### 🤖 Claude Bot Review\n\n${review}`
             });
+            
+            console.log('Comment posted successfully:', comment.data.id);
 
-      - name: Handle errors
+      - name: Post error comment
         if: failure()
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const issue = context.issue;
+            const issue_number = ${{ steps.extract.outputs.issue_number }};
+            const error = `${{ steps.claude-api.outputs.error }}`;
             
             github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: issue.number,
-              body: '❌ Claude review failed. Please check your API key and try again.'
+              issue_number: issue_number,
+              body: `❌ **Claude Review Failed**\n\n\`\`\`\n${error || 'Unknown error occurred'}\n\`\`\`\n\n**Troubleshooting:**\n- Check that \`ANTHROPIC_API_KEY\` secret is set in repository settings\n- Verify your API key is valid\n- Check that your account has available credits\n- View the workflow logs for more details`
             });
