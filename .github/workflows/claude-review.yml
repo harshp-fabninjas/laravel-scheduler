@@ -28,13 +28,10 @@ jobs:
       - name: Prepare Claude prompt
         id: prompt
         run: |
-          # Extract the actual user message (remove @claude mention)
           USER_MESSAGE="${{ github.event.comment.body }}"
           USER_MESSAGE="${USER_MESSAGE//@claude/}"
           USER_MESSAGE=$(echo "$USER_MESSAGE" | xargs)
-          
           echo "cleaned_message=$USER_MESSAGE" >> $GITHUB_OUTPUT
-          echo "Cleaned message: $USER_MESSAGE"
 
       - name: Get PR Details
         id: pr
@@ -55,53 +52,60 @@ jobs:
 
       - name: Call Claude API
         id: claude
+        env:
+          CLEANED_MSG: ${{ steps.prompt.outputs.cleaned_message }}
+          PR_TITLE: ${{ steps.pr.outputs.title }}
+          PR_AUTHOR: ${{ steps.pr.outputs.author }}
+          PR_ADDITIONS: ${{ steps.pr.outputs.additions }}
+          PR_DELETIONS: ${{ steps.pr.outputs.deletions }}
+          PR_BODY: ${{ steps.pr.outputs.body }}
+          API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          # Build the prompt
-          PROMPT="You are a code review assistant on GitHub. A user is asking you about a pull request.
-
-User's Request: ${{ steps.prompt.outputs.cleaned_message }}
-
-PR Title: ${{ steps.pr.outputs.title }}
-PR Author: ${{ steps.pr.outputs.author }}
-PR Stats: +${{ steps.pr.outputs.additions }} / -${{ steps.pr.outputs.deletions }}
-PR Description: ${{ steps.pr.outputs.body }}
-
-Please respond to their request with helpful, specific feedback about the PR."
-
-          # Escape the prompt for JSON
-          PROMPT_ESCAPED=$(echo "$PROMPT" | jq -Rs .)
-
+          # Create request JSON
+          REQUEST=$(cat <<'REQEOF'
+          {
+            "model": "claude-opus-4-20250805",
+            "max_tokens": 2048,
+            "messages": [
+              {
+                "role": "user",
+                "content": "You are a code review assistant on GitHub.\n\nUser's Request: USER_MSG_HERE\n\nPR Title: PR_TITLE_HERE\nPR Author: PR_AUTHOR_HERE\nPR Stats: +PR_ADDITIONS_HERE / -PR_DELETIONS_HERE\nPR Description: PR_BODY_HERE\n\nPlease respond to their request with helpful, specific feedback about the PR."
+              }
+            ]
+          }
+          REQEOF
+          )
+          
+          # Replace placeholders
+          REQUEST="${REQUEST//USER_MSG_HERE/$CLEANED_MSG}"
+          REQUEST="${REQUEST//PR_TITLE_HERE/$PR_TITLE}"
+          REQUEST="${REQUEST//PR_AUTHOR_HERE/$PR_AUTHOR}"
+          REQUEST="${REQUEST//PR_ADDITIONS_HERE/$PR_ADDITIONS}"
+          REQUEST="${REQUEST//PR_DELETIONS_HERE/$PR_DELETIONS}"
+          REQUEST="${REQUEST//PR_BODY_HERE/$PR_BODY}"
+          
           # Make API call
           RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
-            -H "x-api-key: ${{ secrets.ANTHROPIC_API_KEY }}" \
+            -H "x-api-key: $API_KEY" \
             -H "anthropic-version: 2023-06-01" \
             -H "content-type: application/json" \
-            -d "{
-              \"model\": \"claude-opus-4-20250805\",
-              \"max_tokens\": 2048,
-              \"messages\": [
-                {
-                  \"role\": \"user\",
-                  \"content\": $PROMPT_ESCAPED
-                }
-              ]
-            }")
-
-          echo "API Response: $RESPONSE"
-
-          # Extract the review text
+            -d "$REQUEST")
+          
+          echo "API Response:"
+          echo "$RESPONSE" | jq . || echo "$RESPONSE"
+          
+          # Extract review
           REVIEW=$(echo "$RESPONSE" | jq -r '.content[0].text // empty')
           
           if [ -z "$REVIEW" ]; then
-            echo "ERROR: No review text found in response"
-            echo "$RESPONSE" | jq .
+            echo "ERROR: No review found"
             exit 1
           fi
-
-          # Save to output
-          echo "review<<REVIEW_EOF" >> $GITHUB_OUTPUT
+          
+          # Save output
+          echo "review<<REVIEWEOF" >> $GITHUB_OUTPUT
           echo "$REVIEW" >> $GITHUB_OUTPUT
-          echo "REVIEW_EOF" >> $GITHUB_OUTPUT
+          echo "REVIEWEOF" >> $GITHUB_OUTPUT
 
       - name: Post Review Comment
         uses: actions/github-script@v7
@@ -125,5 +129,5 @@ Please respond to their request with helpful, specific feedback about the PR."
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: `❌ Claude review failed. Make sure:\n1. \`ANTHROPIC_API_KEY\` is set in Settings → Secrets\n2. API key is valid\n3. Check workflow logs for details`
+              body: `❌ Claude review failed.\n\nMake sure:\n1. ANTHROPIC_API_KEY is set in Settings → Secrets\n2. API key is valid\n3. Check workflow logs for details`
             });
