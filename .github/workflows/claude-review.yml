@@ -78,7 +78,7 @@ PR Title: ${prTitle}
 PR Description: ${prBody || 'No description provided'}
 
 Diff:
-\`\`\`diff
+\`\`\`
 ${prDiff}
 \`\`\`
 
